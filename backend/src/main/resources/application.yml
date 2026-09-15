@@ -1,0 +1,98 @@
+server:
+  port: ${SERVER_PORT:8443}
+  # TLS is required before this API is reachable from anything but localhost.
+  # Generate a local cert (e.g. `mkcert localhost`) and uncomment below, or
+  # terminate TLS at a reverse proxy you control. See backend/README.md.
+  # ssl:
+  #   key-store: ${SSL_KEYSTORE_PATH}
+  #   key-store-password: ${SSL_KEYSTORE_PASSWORD}
+  #   key-store-type: PKCS12
+
+spring:
+  application:
+    name: digital-self-backend
+  servlet:
+    multipart:
+      max-file-size: ${MAX_UPLOAD_SIZE:100MB}
+      max-request-size: ${MAX_UPLOAD_SIZE:100MB}
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:postgres}?currentSchema=${DB_SCHEMA:digitalself}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        default_schema: ${DB_SCHEMA:digitalself}
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    # Flyway owns the schema: create-schemas means no manual CREATE SCHEMA step,
+    # and keeping the app's tables out of `public` leaves the shared postgres
+    # database usable for other things.
+    schemas: ${DB_SCHEMA:digitalself}
+    create-schemas: true
+    default-schema: ${DB_SCHEMA:digitalself}
+    # The pgvector-dependent migration is added by the `pgvector` profile below.
+    locations: classpath:db/migration
+
+digitalself:
+  crypto:
+    # Base64-encoded 32 bytes. Required for file uploads; never commit a real value.
+    master-key: ${DIGITALSELF_MASTER_KEY:}
+    master-key-label: ${DIGITALSELF_MASTER_KEY_LABEL:default}
+    storage-path: ${FILE_STORAGE_PATH:./data/files}
+  jwt:
+    # Must be set via env var in every real environment; there is no default.
+    secret: ${JWT_SECRET:}
+    access-token-ttl-minutes: 15
+    refresh-token-ttl-days: 30
+  ollama:
+    base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+    chat-model: ${OLLAMA_CHAT_MODEL:llama3.2:1b}
+    embedding-model: ${OLLAMA_EMBEDDING_MODEL:nomic-embed-text}
+  auth:
+    login-rate-limit:
+      max-attempts: 5
+      window-minutes: 15
+  extraction:
+    # Extracted candidates at or above this confidence become memories without
+    # review. Set above 1.0 to require review of everything.
+    auto-accept-confidence: 0.9
+  file-extraction:
+    # Ceiling on text taken from one document. Document parsers are an attack
+    # surface: an OOXML file is a zip, and a small one can expand to gigabytes.
+    write-limit-chars: 500000
+    # Wall-clock ceiling per document, so a pathological file cannot pin a thread.
+    timeout-seconds: 60
+    # Below this, extracted text is not worth a memory (e.g. a lone page number).
+    min-chars-to-index: 20
+  rag:
+    max-context-memories: 8
+    # A memory derived from a whole document can be enormous; without a cap a
+    # few of them would exceed any local model's context window.
+    max-chars-per-context-memory: 2000
+    # Cosine distance ceiling for a vector hit to count as relevant. Raise it and
+    # the assistant stretches for loosely-related memories; lower it and it says
+    # "I don't have a memory of that" more often.
+    max-vector-distance: 0.6
+    chunk-size: 1000
+    chunk-overlap: 100
+
+logging:
+  level:
+    com.digitalself: INFO
+
+---
+# Activate with SPRING_PROFILES_ACTIVE=pgvector once the vector extension is
+# installed on the Postgres server. Without it the app still runs; retrieval
+# falls back to full-text search only and /api/health reports pgvector missing.
+spring:
+  config:
+    activate:
+      on-profile: pgvector
+  flyway:
+    locations: classpath:db/migration,classpath:db/migration-vector

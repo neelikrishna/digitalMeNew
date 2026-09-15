@@ -1,0 +1,3 @@
+digitalself:
+  jwt:
+    secret: test-secret-do-not-use-in-real-environments-0123456789

@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+# ...but the template carries no real values and must be committed, or nobody
+# can reproduce the setup the READMEs describe.
+!.env.example
+*.pem
+*.key
+
+# Java / Spring Boot
+backend/target/
+backend/.mvn/
+*.class
+
+# Node / React Native
+mobile/node_modules/
+mobile/.expo/
+
+# Python
+scripts/__pycache__/
+scripts/.venv/
+*.pyc
+
+# Local data (never commit real personal data or encrypted stores)
+data/
+*.enc
+
+# IDE
+.vscode/
+.idea/
