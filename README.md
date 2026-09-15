@@ -13,7 +13,7 @@ file text-extraction work added since has not yet been run — see
 - Phase 1: schema migrations, auth (register/login/refresh, Argon2 + JWT + refresh rotation), Ollama behind an `AIService`/`EmbeddingService` abstraction, health check.
 - Phase 2: memory create/revise/archive/restore with full version history, metadata editing, and keyword/date/type/tag search.
 - Phase 3: embeddings in pgvector, hybrid semantic + full-text retrieval, RAG chat that answers only from stored memories, AI memory extraction with confidence-gated review, knowledge-graph links.
-- Phase 4 (partial): encrypted file storage — per-file keys wrapped by a master key held outside the database, content sniffed from bytes, crypto-shredding as permanent delete. Plus selective encryption of sensitive memories (title, content and version history), which trades their searchability for genuine confidentiality at rest. Plus text extraction: upload a PDF or Word document and its *contents* become searchable and answerable, via a memory derived from the extracted text. EXIF and transcription still to come.
+- Phase 4 (partial): encrypted file storage — per-file keys wrapped by a master key held outside the database, content sniffed from bytes, crypto-shredding as permanent delete. Plus selective encryption of sensitive memories (title, content and version history), which trades their searchability for genuine confidentiality at rest. Plus text extraction: upload a PDF or Word document and its *contents* become searchable and answerable, via a memory derived from the extracted text. Plus photo EXIF — date, location and dimensions — which deliberately does *not* become a memory, since metadata is not something you asserted. Transcription and WhatsApp import still to come.
 
 Runs against a locally installed PostgreSQL and Ollama — Docker is optional. `pgvector` is optional too: without it, retrieval falls back to full-text search and `/api/health` says so.
 
@@ -21,6 +21,7 @@ Schema, JPA mappings, versioning, full-text search and cross-user isolation are 
 
 ## Documentation
 
+- [**Pending work**](TODO.md) — everything outstanding, in one place.
 - [Architecture](docs/architecture.md) — component design and the reasoning behind each major technology choice.
 - [Database Design](docs/database-design.md) — ER diagram and schema.
 - [Security](docs/security.md) — encryption, auth, RBAC, audit, backups.

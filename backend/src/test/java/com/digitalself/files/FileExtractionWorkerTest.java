@@ -35,7 +35,9 @@ class FileExtractionWorkerTest {
 
     private StoredFileRepository fileRepository;
     private FileMetadataRepository metadataRepository;
+    private MediaMetadataRepository mediaRepository;
     private FileTextExtractor extractor;
+    private ImageMetadataReader imageMetadataReader;
     private FileService fileService;
     private MemoryService memoryService;
     private MemoryFileLinkStore linkStore;
@@ -49,19 +51,24 @@ class FileExtractionWorkerTest {
     void setUp() {
         fileRepository = mock(StoredFileRepository.class);
         metadataRepository = mock(FileMetadataRepository.class);
+        mediaRepository = mock(MediaMetadataRepository.class);
         extractor = mock(FileTextExtractor.class);
+        imageMetadataReader = mock(ImageMetadataReader.class);
         fileService = mock(FileService.class);
         memoryService = mock(MemoryService.class);
         linkStore = mock(MemoryFileLinkStore.class);
         textCrypto = mock(TextCrypto.class);
 
         when(extractor.supports(anyString())).thenReturn(true);
+        when(extractor.isImage(anyString())).thenReturn(false);
         when(fileService.readContent(any())).thenReturn("irrelevant".getBytes(StandardCharsets.UTF_8));
         when(metadataRepository.findById(fileId)).thenReturn(Optional.of(new FileMetadata(fileId)));
+        when(mediaRepository.findById(fileId)).thenReturn(Optional.empty());
         when(memoryService.create(any(), any())).thenReturn(memoryResponse(UUID.randomUUID()));
 
-        worker = new FileExtractionWorker(fileRepository, metadataRepository, extractor, fileService,
-                memoryService, linkStore, textCrypto, mock(AuditService.class), new FileExtractionProperties());
+        worker = new FileExtractionWorker(fileRepository, metadataRepository, mediaRepository, extractor,
+                imageMetadataReader, fileService, memoryService, linkStore, textCrypto,
+                mock(AuditService.class), new FileExtractionProperties());
     }
 
     @Test
@@ -161,13 +168,81 @@ class FileExtractionWorkerTest {
     }
 
     @Test
-    void photosAndAudioAreRecordedAsUnsupportedRatherThanFailed() {
-        givenFile(false, "holiday.jpg");
-        when(extractor.supports("image/jpeg")).thenReturn(false);
+    void audioAndVideoAreRecordedAsUnsupportedRatherThanFailed() {
+        givenFile(false, "interview.mp3");
+        when(extractor.supports("audio/mpeg")).thenReturn(false);
 
         assertEquals(ExtractionStatus.UNSUPPORTED, worker.extract(userId, fileId));
         verify(extractor, never()).extract(any(), anyString());
         verify(memoryService, never()).create(any(), any());
+    }
+
+    /**
+     * The guarantee from docs/media-ingestion.md Section 3, asserted rather than
+     * assumed: a photo's EXIF is metadata, not something the owner said, and
+     * manufacturing a memory from it would put a claim nobody made into the pool
+     * the assistant answers from.
+     */
+    @Test
+    void aPhotoYieldsCaptureMetadataButNeverAMemory() {
+        givenFile(false, "holiday.jpg");
+        when(extractor.isImage("image/jpeg")).thenReturn(true);
+        givenExtraction("", false);
+        Instant taken = Instant.parse("2019-06-03T14:22:00Z");
+        when(imageMetadataReader.read(any())).thenReturn(new ImageMetadataReader.Reading(
+                "{\"Make\":\"Canon\"}", taken, 4032, 3024, 51.5074, -0.1278));
+
+        assertEquals(ExtractionStatus.UNSUPPORTED, worker.extract(userId, fileId),
+                "UNSUPPORTED is the honest answer about text; the photo is still processed");
+
+        ArgumentCaptor<MediaMetadata> captor = ArgumentCaptor.forClass(MediaMetadata.class);
+        verify(mediaRepository).save(captor.capture());
+        MediaMetadata media = captor.getValue();
+        assertEquals(taken, media.getTakenAt());
+        assertEquals(4032, media.getWidth());
+        assertEquals(51.5074, media.getLatitude());
+        assertEquals(MediaType.PHOTO, media.getMediaType());
+
+        verify(memoryService, never()).create(any(), any());
+        verify(linkStore, never()).link(any(), any());
+    }
+
+    /**
+     * Most photos shared through messaging apps have had their EXIF stripped.
+     * They still get a row: "we looked and found nothing" must be
+     * distinguishable from "we never looked".
+     */
+    @Test
+    void aPhotoWithNoExifStillGetsARow() {
+        givenFile(false, "stripped.jpg");
+        when(extractor.isImage("image/jpeg")).thenReturn(true);
+        givenExtraction("", false);
+        when(imageMetadataReader.read(any()))
+                .thenReturn(new ImageMetadataReader.Reading(null, null, null, null, null, null));
+
+        worker.extract(userId, fileId);
+
+        ArgumentCaptor<MediaMetadata> captor = ArgumentCaptor.forClass(MediaMetadata.class);
+        verify(mediaRepository).save(captor.capture());
+        assertNull(captor.getValue().getTakenAt());
+        assertNotNull(captor.getValue().getExtractedAt(), "the attempt itself must be recorded");
+    }
+
+    /**
+     * A corrupt image must not mark the file as a failed extraction — there was
+     * never any text to extract, and losing a capture date is not worth failing
+     * an upload over.
+     */
+    @Test
+    void anUnreadableImageDoesNotFailTheFile() {
+        givenFile(false, "corrupt.jpg");
+        when(extractor.isImage("image/jpeg")).thenReturn(true);
+        when(extractor.extract(any(), anyString()))
+                .thenThrow(new FileExtractionException("not really a jpeg", new RuntimeException()));
+
+        assertEquals(ExtractionStatus.UNSUPPORTED, capturedStatusAfterExtract(),
+                "a broken photo is still not a failed text extraction");
+        verify(mediaRepository, never()).save(any());
     }
 
     @Test
@@ -201,8 +276,21 @@ class FileExtractionWorkerTest {
         verify(memoryService).revise(eq(userId), eq(existing), any(ReviseMemoryRequest.class));
     }
 
+    private ExtractionStatus capturedStatusAfterExtract() {
+        ExtractionStatus returned = worker.extract(userId, fileId);
+        assertEquals(returned, capturedMetadata().getExtractionStatus());
+        return returned;
+    }
+
     private void givenFile(boolean sensitive, String filename) {
-        String mimeType = filename.endsWith(".jpg") ? "image/jpeg" : "application/pdf";
+        String mimeType;
+        if (filename.endsWith(".jpg")) {
+            mimeType = "image/jpeg";
+        } else if (filename.endsWith(".mp3")) {
+            mimeType = "audio/mpeg";
+        } else {
+            mimeType = "application/pdf";
+        }
         StoredFile file = new StoredFile(userId, "ab/blob.enc", "hash", mimeType, filename, sensitive);
         setId(file, fileId);
         when(fileRepository.findByIdAndUserId(fileId, userId)).thenReturn(Optional.of(file));

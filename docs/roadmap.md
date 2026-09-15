@@ -2,6 +2,8 @@
 
 Each phase ends with a checkpoint: nothing in the next phase starts without your explicit go-ahead, per the project's development rules.
 
+For the flat list of everything outstanding — including gaps inside phases already marked complete — see [../TODO.md](../TODO.md).
+
 ## Phase 1 — Foundation *(code complete, not yet run against a live database)*
 - Repository structure.
 - Spring Boot backend skeleton, PostgreSQL connection, Flyway migrations for the core schema.
@@ -38,11 +40,12 @@ Done:
 
 - Text extraction from PDFs and Office documents, so uploads feed search and RAG. Designed and built in Java rather than Python — see [file-ingestion.md](file-ingestion.md) for the reasoning and the two promises it changed. Not yet run.
 
-Still outstanding:
-- Photo EXIF extraction (dates, location) and linking photos to memories.
-- Audio/video ingestion with local transcription.
-- WhatsApp export parsing.
-- The Python ingestion pipeline, now scoped to EXIF, transcription and WhatsApp only.
+- Photo EXIF extraction (dates, location). Built in Java — Tika already provided it, no Python and no new dependency. Photos deliberately do *not* become memories; see [media-ingestion.md](media-ingestion.md) Section 3. Not yet run.
+
+Still outstanding — designed in [media-ingestion.md](media-ingestion.md), awaiting approval:
+- TLS, which that design makes a prerequisite for anything crossing a process boundary.
+- WhatsApp export parsing (Python).
+- Audio/video ingestion with local transcription (Python).
 - OCR for scanned documents (needs Tesseract; not decided).
 
 ## Phase 5 — Mobile App

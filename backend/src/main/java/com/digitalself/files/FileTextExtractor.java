@@ -5,10 +5,10 @@ import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.BodyContentHandler;
-import org.apache.tika.sax.WriteOutContentHandler;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayInputStream;
+import java.io.Writer;
 import java.util.Set;
 import java.util.concurrent.*;
 
@@ -59,6 +59,17 @@ public class FileTextExtractor {
     }
 
     /**
+     * True for images, which have no text worth chasing but do carry EXIF.
+     *
+     * <p>Separate from {@link #supports(String)} because the two ask different
+     * questions — "is there text here?" and "is there capture metadata here?" —
+     * and a photo answers no to the first and yes to the second.
+     */
+    public boolean isImage(String mimeType) {
+        return mimeType != null && mimeType.toLowerCase().startsWith("image/");
+    }
+
+    /**
      * @return the document's text, possibly empty when there is no text layer
      * @throws FileExtractionException if parsing failed or ran past its timeout
      */
@@ -96,25 +107,78 @@ public class FileTextExtractor {
     }
 
     private Result parse(byte[] content) throws Exception {
-        // WriteOutContentHandler is held separately from the BodyContentHandler
-        // wrapping it, because it is the only thing that can tell a write-limit
-        // stop apart from a genuine SAX failure.
-        WriteOutContentHandler writeOut = new WriteOutContentHandler(properties.getWriteLimitChars());
-        BodyContentHandler handler = new BodyContentHandler(writeOut);
-        boolean truncated = false;
+        // The limit is enforced by our own Writer rather than Tika's
+        // write-limit handler. Tika signals that limit by throwing, and the API
+        // for telling that throw apart from a real parse failure moved between
+        // Tika 1.x and 2.x — so detecting it correctly would tie this class to a
+        // transitive dependency's version. Bounding the buffer ourselves is
+        // both simpler and version-proof.
+        LimitedWriter writer = new LimitedWriter(properties.getWriteLimitChars());
+        BodyContentHandler handler = new BodyContentHandler(writer);
+        // Carried out rather than discarded: for an image this is the whole
+        // point of the parse, since it is where EXIF arrives.
+        Metadata metadata = new Metadata();
 
         try (ByteArrayInputStream stream = new ByteArrayInputStream(content)) {
-            new AutoDetectParser().parse(stream, handler, new Metadata(), new ParseContext());
-        } catch (org.xml.sax.SAXException e) {
-            if (!writeOut.isWriteLimitReached(e)) {
-                throw e;
-            }
-            // Hitting the limit is a success with a boundary, not a failure:
-            // keep what was read and say it was cut short.
-            truncated = true;
+            new AutoDetectParser().parse(stream, handler, metadata, new ParseContext());
         }
 
-        return new Result(normalise(writeOut.toString()), truncated);
+        return new Result(normalise(writer.text()), writer.isTruncated(), metadata);
+    }
+
+    /**
+     * Collects parser output up to a hard character ceiling and silently drops
+     * the rest.
+     *
+     * <p>Stored text stays bounded however far the parser runs, which is the
+     * protection that matters against a document that expands — an OOXML file is
+     * a zip archive. The parse is no longer aborted the moment the limit is hit,
+     * so a pathological file keeps consuming CPU; that is what the wall-clock
+     * timeout in {@link #extract} is for. Memory is bounded here, time is
+     * bounded there.
+     */
+    private static final class LimitedWriter extends Writer {
+
+        private final StringBuilder out = new StringBuilder();
+        private final int limit;
+        private boolean truncated;
+
+        LimitedWriter(int limit) {
+            this.limit = limit;
+        }
+
+        @Override
+        public void write(char[] buffer, int offset, int length) {
+            int remaining = limit - out.length();
+            if (remaining <= 0) {
+                truncated = true;
+                return;
+            }
+            if (length > remaining) {
+                out.append(buffer, offset, remaining);
+                truncated = true;
+                return;
+            }
+            out.append(buffer, offset, length);
+        }
+
+        @Override
+        public void flush() {
+            // Nothing buffered beyond the builder.
+        }
+
+        @Override
+        public void close() {
+            // Nothing to release.
+        }
+
+        String text() {
+            return out.toString();
+        }
+
+        boolean isTruncated() {
+            return truncated;
+        }
     }
 
     /**
@@ -143,8 +207,16 @@ public class FileTextExtractor {
     /**
      * @param text      extracted text; empty when the document has no text layer
      * @param truncated whether the write limit cut the text short
+     * @param metadata  everything the parser learned about the file that was not
+     *                  its text — EXIF for a photo, author and title for a
+     *                  document. Never null.
      */
-    public record Result(String text, boolean truncated) {
+    public record Result(String text, boolean truncated, Metadata metadata) {
+
+        /** For callers that only care about the text. */
+        public Result(String text, boolean truncated) {
+            this(text, truncated, new Metadata());
+        }
 
         public boolean isEmpty() {
             return text == null || text.isBlank();

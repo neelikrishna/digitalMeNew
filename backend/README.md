@@ -108,10 +108,12 @@ forever would be noise. OCR would change that, and needs Tesseract — not
 installed, not decided.
 
 **Two limits, both protecting the process rather than the data.** An OOXML file
-is a zip archive and a small one can expand to gigabytes, so extraction stops at
-`write-limit-chars` (500k) and is abandoned after `timeout-seconds` (60). Hitting
-the character limit truncates rather than fails, and the truncation is written
-into the memory text so an answer drawn from a partial document can say so.
+is a zip archive and a small one can expand to gigabytes, so stored text is
+capped at `write-limit-chars` (500k) and the whole parse is abandoned after
+`timeout-seconds` (60). Memory is bounded by the first, time by the second.
+Hitting the character limit truncates rather than fails, and the truncation is
+written into the memory text so an answer drawn from a partial document can say
+so.
 
 **Sensitive files.** `sensitive=true` on upload encrypts the extracted text under
 the file's own key and derives a *sensitive* memory — so it is never embedded and
@@ -119,6 +121,30 @@ never full-text searched, exactly like a sensitive memory. The default is
 plaintext, because text that cannot be searched would defeat the point of
 extracting it. The trade-off is the one already made for memories; the reasoning
 is in [../docs/file-ingestion.md](../docs/file-ingestion.md) Section 4.
+
+## Photos
+
+Uploading a photo reads its EXIF into the `media` table: when it was taken,
+where, and its dimensions. `GET /api/files/{id}` returns them under `photo`.
+The full metadata block is kept verbatim in `exif_json`, so deciding later that
+a different tag mattered does not mean re-reading every photo.
+
+`taken_at` is the *original* capture date, not the file timestamp — a copied or
+re-encoded photo keeps the former and loses the latter, and it is the former that
+says when the memory happened.
+
+**Photos do not become memories, deliberately.** A document's text is something
+someone asserted, so turning it into a memory puts a real statement into
+retrieval. A photo's EXIF is not an assertion. Generating *"Photo taken on 3 June
+2019 at 51.50, -0.12"* as a memory would place a sentence nobody ever said into
+the pool the assistant answers from — which undercuts the no-hallucinated-memories
+rule from the inside — and ten thousand photos would drown everything you actually
+wrote. Photos are findable by date and location, and attachable to memories you
+write. See [../docs/media-ingestion.md](../docs/media-ingestion.md) Section 3.
+
+A photo still reports `UNSUPPORTED` for *text* extraction. That is the honest
+answer to a question about text, and it is a different question from whether
+capture metadata was read — which the `media` row records.
 
 **Shredding a file also deletes the memory derived from it** — the one hard
 delete in the system. Crypto-shredding is advertised as permanent, and it would
@@ -242,6 +268,7 @@ All tests run without a database or a model:
 - `FileTextExtractorTest` — real PDFs assembled byte by byte (rather than with PDFBox, whose API moved between 2.x and 3.x), plain text normalisation, a PDF with no text layer coming back empty rather than failing, truncation at the write limit, and media types skipped without a parse.
 - `FileExtractionWorkerTest` — where extracted text goes: `FILE_EXTRACTION` provenance, the derived memory attached to its file, **a sensitive file leaving no plaintext anywhere**, a failed parse recorded as retryable without losing the file, a scan settled as `EMPTY`, and re-extraction revising the existing memory instead of adding a second.
 - `FileIngestionServiceTest` — an extraction failure never escapes into the already-committed upload, and one bad document does not abort the rest of a backfill.
+- `ImageMetadataReaderTest` — the malformed EXIF that actually arrives: out-of-range coordinates dropped rather than violating the check constraint, unparseable coordinates dropped without costing the capture date, and parser provenance kept out of the stored block.
 
 - `SchemaIntegrationTest` — runs against a **real PostgreSQL**, started as a temporary subprocess by Zonky embedded-postgres (no Docker, no install, your own server untouched). It verifies the Flyway migrations apply, every JPA mapping matches the schema (via `ddl-auto: validate`, which fails the context on any mismatch), version history persists across a revision, tsvector search matches stemmed words, search does not leak across users, archive hides without deleting, links persist in both directions, and extraction preserves raw input.
 
@@ -254,8 +281,10 @@ The integration test earned its place immediately: it caught a `LazyInitializati
 - No TLS wired up yet — `server.ssl.*` in `application.yml` is commented out; uncomment and point at a local cert (e.g. via `mkcert`) before trusting this over anything but localhost.
 - **Only memories marked sensitive are encrypted.** Ordinary memory text sits in plaintext columns so it stays searchable — see "Sensitive memories" above for the reasoning and the trade-off.
 - DB user is not yet least-privilege — the app currently connects as `postgres`.
-- EXIF and transcription are not implemented, so photos, audio and video contribute nothing to search or RAG — they are recorded `UNSUPPORTED`, waiting on the Python pipeline. Scanned PDFs need OCR (Tesseract), which is not installed or decided.
-- The new extraction code has **not been run**: `mvn test` has not been executed against it, and `tika-parsers-standard-package` has never been downloaded. Treat the extraction tests as unverified until that first run.
+- Transcription is not implemented, so audio and video contribute nothing — they are recorded `UNSUPPORTED`, waiting on the Python pipeline. Scanned PDFs need OCR (Tesseract), which is not installed or decided.
+- **No test reads a real EXIF-bearing JPEG.** The mapping is covered against synthetic Tika metadata and the wiring against an EXIF-free PNG, so the path from real camera bytes to `taken_at` is unproven. Upload one photo from your phone and check `GET /api/files/{id}`.
+- The extraction and EXIF code has **not been run**: `mvn test` has not been executed against it, and `tika-parsers-standard-package` has never been downloaded. Treat those tests as unverified until that first run.
+- Photos are stored and readable but there is no endpoint to browse them by date or location yet — `MediaMetadataRepository.findTakenBetween` exists and is unused.
 - One memory per document is coarse. A 200-page PDF is a single memory, retrieved or not as a unit; `max-chars-per-context-memory` caps what reaches the prompt. One memory per section is the follow-up.
 - The **pgvector** SQL in `EmbeddingStore` is still unverified — the extension isn't installed locally, so vector insert/search has never executed. Everything else in the schema now runs against real Postgres in `SchemaIntegrationTest`.
 - The HTTP layer is unverified: no test drives the controllers, JWT filter, or Spring Security chain end-to-end. Services and persistence are covered; request/response wiring is not.

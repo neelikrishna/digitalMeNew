@@ -6,6 +6,8 @@ import com.digitalself.auth.UserRole;
 import com.digitalself.extraction.*;
 import com.digitalself.files.ExtractionStatus;
 import com.digitalself.files.FileMetadata;
+import com.digitalself.files.MediaMetadata;
+import com.digitalself.files.MediaType;
 import com.digitalself.files.StoredFile;
 import com.digitalself.memory.*;
 import com.digitalself.memory.dto.CreateMemoryRequest;
@@ -121,6 +123,8 @@ class SchemaIntegrationTest {
     private com.digitalself.files.FileIngestionService fileIngestionService;
     @Autowired
     private com.digitalself.files.FileMetadataRepository fileMetadataRepository;
+    @Autowired
+    private com.digitalself.files.MediaMetadataRepository mediaMetadataRepository;
     @Autowired
     private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
 
@@ -568,10 +572,7 @@ class SchemaIntegrationTest {
      */
     @Test
     void imagesAreRecordedAsUnsupportedRatherThanFailed() {
-        byte[] png = new byte[]{(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
-                0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0};
-
-        StoredFile stored = fileService.upload(userId, "photo.png", png, false);
+        StoredFile stored = fileService.upload(userId, "photo.png", onePixelPng(), false);
 
         FileMetadata metadata = fileMetadataRepository.findById(stored.getId()).orElseThrow();
         assertEquals(ExtractionStatus.UNSUPPORTED, metadata.getExtractionStatus());
@@ -579,5 +580,46 @@ class SchemaIntegrationTest {
 
         // And the backfill must not pick them up on every run.
         assertEquals(0, fileIngestionService.reindex(userId));
+    }
+
+    /**
+     * A photo is processed even though it has no text: the media row records
+     * that its metadata was read. Also the first thing to run the JSONB mapping
+     * on {@code media.exif_json} against a real Postgres.
+     */
+    @Test
+    void aPhotoGetsAMediaRowRecordingThatItWasRead() {
+        StoredFile stored = fileService.upload(userId, "photo.png", onePixelPng(), false);
+
+        MediaMetadata media = mediaMetadataRepository.findById(stored.getId()).orElseThrow();
+        assertEquals(MediaType.PHOTO, media.getMediaType());
+        assertNotNull(media.getExtractedAt(),
+                "\"we looked and found nothing\" must be distinguishable from \"we never looked\"");
+    }
+
+    /**
+     * The guarantee from docs/media-ingestion.md Section 3. A photo's EXIF is
+     * metadata, not something the owner asserted — turning it into a memory
+     * would put a sentence nobody said into the pool the assistant answers from.
+     */
+    @Test
+    void aPhotoNeverBecomesAMemory() {
+        long before = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memories WHERE user_id = ?", Long.class, userId);
+
+        fileService.upload(userId, "photo.png", onePixelPng(), false);
+
+        assertEquals(before, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memories WHERE user_id = ?", Long.class, userId),
+                "uploading a photo must not create a memory");
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memories WHERE user_id = ? AND source = 'FILE_EXTRACTION'",
+                Integer.class, userId));
+    }
+
+    /** Valid 1x1 PNG. Carries no EXIF, which is the common case for a stripped image. */
+    private static byte[] onePixelPng() {
+        return Base64.getDecoder().decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
     }
 }

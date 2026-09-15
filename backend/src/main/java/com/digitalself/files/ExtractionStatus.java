@@ -20,7 +20,13 @@ public enum ExtractionStatus {
     /** Parsed successfully, but the document contains no text layer (e.g. a scan). */
     EMPTY,
 
-    /** Not a document — an image, audio or video file. Later phases handle these. */
+    /**
+     * No text layer to read: an image, audio or video file.
+     *
+     * <p>Not the same as "nothing happened". A photo's EXIF is read and stored
+     * in {@code media} — this status answers only the question about text.
+     * Audio and video wait on transcription in a later phase.
+     */
     UNSUPPORTED,
 
     /** The parser failed. Retryable via POST /api/files/reindex. */

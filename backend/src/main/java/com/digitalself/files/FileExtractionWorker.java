@@ -39,7 +39,9 @@ public class FileExtractionWorker {
 
     private final StoredFileRepository fileRepository;
     private final FileMetadataRepository metadataRepository;
+    private final MediaMetadataRepository mediaRepository;
     private final FileTextExtractor extractor;
+    private final ImageMetadataReader imageMetadataReader;
     private final FileService fileService;
     private final MemoryService memoryService;
     private final MemoryFileLinkStore linkStore;
@@ -49,7 +51,9 @@ public class FileExtractionWorker {
 
     public FileExtractionWorker(StoredFileRepository fileRepository,
                                 FileMetadataRepository metadataRepository,
+                                MediaMetadataRepository mediaRepository,
                                 FileTextExtractor extractor,
+                                ImageMetadataReader imageMetadataReader,
                                 FileService fileService,
                                 MemoryService memoryService,
                                 MemoryFileLinkStore linkStore,
@@ -58,7 +62,9 @@ public class FileExtractionWorker {
                                 FileExtractionProperties properties) {
         this.fileRepository = fileRepository;
         this.metadataRepository = metadataRepository;
+        this.mediaRepository = mediaRepository;
         this.extractor = extractor;
+        this.imageMetadataReader = imageMetadataReader;
         this.fileService = fileService;
         this.memoryService = memoryService;
         this.linkStore = linkStore;
@@ -75,11 +81,21 @@ public class FileExtractionWorker {
         FileMetadata metadata = metadataRepository.findById(fileId)
                 .orElseGet(() -> new FileMetadata(fileId));
 
+        if (extractor.isImage(file.getMimeType())) {
+            // A photo has no text but does have EXIF. Both facts are recorded:
+            // UNSUPPORTED is the honest answer about *text*, and the media row
+            // says the capture metadata was read. See docs/media-ingestion.md
+            // Section 4 for why one column does not try to answer both.
+            readImageMetadata(userId, file);
+            metadata.recordUnsupported(file.getMimeType());
+            return save(metadata);
+        }
+
         if (!extractor.supports(file.getMimeType())) {
-            // Photos, audio and video are not failures — they are simply not
-            // this phase's job. EXIF and transcription come with the Python
-            // pipeline; recording the type keeps that visible instead of
-            // leaving the file looking unprocessed forever.
+            // Audio and video are not failures — they are simply not this
+            // phase's job. Transcription comes with the Python pipeline;
+            // recording the type keeps that visible instead of leaving the
+            // file looking unprocessed forever.
             metadata.recordUnsupported(file.getMimeType());
             return save(metadata);
         }
@@ -107,6 +123,39 @@ public class FileExtractionWorker {
 
         auditService.record(userId, "FILE_TEXT_EXTRACTED", TextCrypto.FILE, fileId, null, null);
         return save(metadata);
+    }
+
+    /**
+     * Reads a photo's EXIF into the {@code media} table.
+     *
+     * <p>Best effort on purpose. A corrupt image must not mark the file as a
+     * failed extraction — there was never any text to extract — and a photo with
+     * no EXIF still gets a row, so "we looked and found nothing" is
+     * distinguishable from "we never looked".
+     *
+     * <p>No memory is derived. A photo's EXIF is metadata, not something the
+     * owner asserted, and manufacturing a sentence from it would put a claim
+     * nobody made into the pool the assistant answers from. See
+     * docs/media-ingestion.md Section 3.
+     */
+    private void readImageMetadata(UUID userId, StoredFile file) {
+        MediaMetadata media = mediaRepository.findById(file.getId())
+                .orElseGet(() -> new MediaMetadata(file.getId(), MediaType.PHOTO));
+        try {
+            FileTextExtractor.Result result =
+                    extractor.extract(fileService.readContent(file), file.getOriginalFilename());
+            ImageMetadataReader.Reading reading = imageMetadataReader.read(result.metadata());
+
+            media.record(reading.exifJson(), reading.takenAt(), reading.width(), reading.height(),
+                    reading.latitude(), reading.longitude());
+            mediaRepository.save(media);
+            auditService.record(userId, "PHOTO_METADATA_READ", TextCrypto.FILE, file.getId(), null, null);
+
+        } catch (Exception e) {
+            // Deliberately swallowed: the photo is stored and safe, and losing
+            // its capture date is not worth failing an upload over.
+            log.warn("Could not read image metadata for file {}: {}", file.getId(), e.toString());
+        }
     }
 
     /**

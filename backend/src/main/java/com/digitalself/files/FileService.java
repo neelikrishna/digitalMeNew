@@ -45,6 +45,7 @@ public class FileService {
 
     private final StoredFileRepository fileRepository;
     private final FileMetadataRepository metadataRepository;
+    private final MediaMetadataRepository mediaRepository;
     private final EncryptionMetadataRepository encryptionMetadataRepository;
     private final EnvelopeEncryptionService encryption;
     private final EncryptedFileStore store;
@@ -55,6 +56,7 @@ public class FileService {
 
     public FileService(StoredFileRepository fileRepository,
                        FileMetadataRepository metadataRepository,
+                       MediaMetadataRepository mediaRepository,
                        EncryptionMetadataRepository encryptionMetadataRepository,
                        EnvelopeEncryptionService encryption,
                        EncryptedFileStore store,
@@ -63,6 +65,7 @@ public class FileService {
                        ApplicationEventPublisher events) {
         this.fileRepository = fileRepository;
         this.metadataRepository = metadataRepository;
+        this.mediaRepository = mediaRepository;
         this.encryptionMetadataRepository = encryptionMetadataRepository;
         this.encryption = encryption;
         this.store = store;
@@ -181,24 +184,28 @@ public class FileService {
     @Transactional(readOnly = true)
     public FileResponse getResponse(UUID userId, UUID fileId) {
         StoredFile file = get(userId, fileId);
-        return FileResponse.from(file, metadataRepository.findById(fileId).orElse(null));
+        return FileResponse.from(file,
+                metadataRepository.findById(fileId).orElse(null),
+                mediaRepository.findById(fileId).orElse(null));
     }
 
     /**
-     * Files with their extraction status. Metadata is fetched in one query
-     * rather than per file: a listing of a hundred uploads should not cost a
-     * hundred round trips to report whether each one was parsed.
+     * Files with their extraction and capture metadata. Both are fetched in one
+     * query each rather than per file: a listing of a hundred uploads should not
+     * cost two hundred round trips to report whether each one was parsed.
      */
     @Transactional(readOnly = true)
     public List<FileResponse> listResponses(UUID userId) {
         List<StoredFile> files = list(userId);
-        Map<UUID, FileMetadata> metadata = metadataRepository
-                .findAllById(files.stream().map(StoredFile::getId).toList())
-                .stream()
+        List<UUID> ids = files.stream().map(StoredFile::getId).toList();
+
+        Map<UUID, FileMetadata> metadata = metadataRepository.findAllById(ids).stream()
                 .collect(Collectors.toMap(FileMetadata::getFileId, Function.identity()));
+        Map<UUID, MediaMetadata> media = mediaRepository.findAllById(ids).stream()
+                .collect(Collectors.toMap(MediaMetadata::getFileId, Function.identity()));
 
         return files.stream()
-                .map(file -> FileResponse.from(file, metadata.get(file.getId())))
+                .map(file -> FileResponse.from(file, metadata.get(file.getId()), media.get(file.getId())))
                 .toList();
     }
 
