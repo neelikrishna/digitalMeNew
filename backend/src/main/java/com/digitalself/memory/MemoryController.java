@@ -70,6 +70,17 @@ public class MemoryController {
         return ResponseEntity.ok(memoryService.updateMetadata(userId, id, request));
     }
 
+    /**
+     * How a memory was split for retrieval. Worth exposing: when an answer cites
+     * an odd passage, the split is usually why, and there is otherwise no way to
+     * see it.
+     */
+    @GetMapping("/{id}/chunks")
+    public ResponseEntity<List<ChunkResponse>> chunks(@AuthenticationPrincipal UUID userId,
+                                                       @PathVariable UUID id) {
+        return ResponseEntity.ok(memoryService.chunks(userId, id));
+    }
+
     @GetMapping("/{id}/history")
     public ResponseEntity<List<MemoryVersionResponse>> history(@AuthenticationPrincipal UUID userId,
                                                                 @PathVariable UUID id) {

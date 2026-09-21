@@ -20,6 +20,13 @@ public class OllamaAIService implements AIService {
 
     @Override
     public String complete(String systemPrompt, String userPrompt, List<Message> history) {
+        return completeWith(properties.getChatModel(), systemPrompt, userPrompt, history);
+    }
+
+    @Override
+    public String completeWith(String model, String systemPrompt, String userPrompt, List<Message> history) {
+        String resolvedModel = model == null || model.isBlank() ? properties.getChatModel() : model;
+
         List<Map<String, String>> messages = new ArrayList<>();
         if (systemPrompt != null && !systemPrompt.isBlank()) {
             messages.add(Map.of("role", "system", "content", systemPrompt));
@@ -30,7 +37,7 @@ public class OllamaAIService implements AIService {
         messages.add(Map.of("role", "user", "content", userPrompt));
 
         Map<String, Object> request = Map.of(
-                "model", properties.getChatModel(),
+                "model", resolvedModel,
                 "messages", messages,
                 "stream", false
         );
@@ -42,7 +49,7 @@ public class OllamaAIService implements AIService {
                 .body(ChatResponse.class);
 
         if (response == null || response.message() == null) {
-            throw new OllamaUnavailableException("Ollama returned an empty response for model " + properties.getChatModel());
+            throw new OllamaUnavailableException("Ollama returned an empty response for model " + resolvedModel);
         }
         return response.message().content();
     }

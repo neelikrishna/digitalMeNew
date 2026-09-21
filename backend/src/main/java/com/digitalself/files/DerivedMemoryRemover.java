@@ -4,6 +4,7 @@ import com.digitalself.memory.EmbeddingOwnerType;
 import com.digitalself.memory.EmbeddingStore;
 import com.digitalself.memory.MemoryRepository;
 import com.digitalself.memory.MemoryVersionRepository;
+import com.digitalself.memory.chunk.MemoryChunkRepository;
 import org.springframework.stereotype.Component;
 
 import java.util.UUID;
@@ -37,15 +38,18 @@ public class DerivedMemoryRemover {
     private final MemoryVersionRepository versionRepository;
     private final MemoryFileLinkStore linkStore;
     private final EmbeddingStore embeddingStore;
+    private final MemoryChunkRepository chunkRepository;
 
     public DerivedMemoryRemover(MemoryRepository memoryRepository,
                                 MemoryVersionRepository versionRepository,
                                 MemoryFileLinkStore linkStore,
-                                EmbeddingStore embeddingStore) {
+                                EmbeddingStore embeddingStore,
+                                MemoryChunkRepository chunkRepository) {
         this.memoryRepository = memoryRepository;
         this.versionRepository = versionRepository;
         this.linkStore = linkStore;
         this.embeddingStore = embeddingStore;
+        this.chunkRepository = chunkRepository;
     }
 
     public void remove(UUID memoryId) {
@@ -57,9 +61,21 @@ public class DerivedMemoryRemover {
         // representation of the text it came from; leaving one behind after a
         // shred would preserve a readable trace of what was meant to be gone.
         // Absence of the table is fine — it means no embedding was ever written.
+        //
+        // Chunk vectors must go explicitly. embeddings.owner_id is polymorphic
+        // and therefore has no foreign key, so deleting the memory cascades to
+        // memory_chunks but leaves their vectors orphaned and still searchable.
         if (embeddingStore.isAvailable()) {
+            for (var chunk : chunkRepository.findByMemoryIdOrderByChunkIndexAsc(memoryId)) {
+                embeddingStore.deleteForOwner(EmbeddingOwnerType.CHUNK, chunk.getId());
+            }
             embeddingStore.deleteForOwner(EmbeddingOwnerType.MEMORY, memoryId);
         }
+
+        // Chunks themselves would cascade with the memory, but are removed here
+        // so the row and its vector disappear together rather than depending on
+        // the order the database unwinds the delete.
+        chunkRepository.deleteByMemoryId(memoryId);
 
         linkStore.unlinkMemory(memoryId);
 

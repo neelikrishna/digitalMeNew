@@ -4,6 +4,18 @@ Each phase ends with a checkpoint: nothing in the next phase starts without your
 
 For the flat list of everything outstanding — including gaps inside phases already marked complete — see [../TODO.md](../TODO.md).
 
+> **Where this is going.** The end goal is a live, always-present voice assistant
+> in the JARVIS/FRIDAY mould, not a text API. Phases 1-4 build the part that is
+> genuinely hard — a private, versioned, searchable memory of a life, and
+> retrieval that refuses to invent. The assistant experience on top of it is
+> designed in [assistant-experience.md](assistant-experience.md); it mostly needs
+> streaming and voice, not more intelligence.
+>
+> [beyond-jarvis.md](beyond-jarvis.md) argues that the voice is the interface and
+> the archive is the product — and sets out five things this can do that no
+> assistant can, because none of them have decades of one person's life with
+> provenance on every claim.
+
 ## Phase 1 — Foundation *(code complete, not yet run against a live database)*
 - Repository structure.
 - Spring Boot backend skeleton, PostgreSQL connection, Flyway migrations for the core schema.

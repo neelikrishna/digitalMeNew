@@ -3,9 +3,7 @@ package com.digitalself.memory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.StringJoiner;
 import java.util.UUID;
 
@@ -54,44 +52,47 @@ public class EmbeddingStore {
     }
 
     /**
-     * Nearest memories by cosine distance. Over-fetches because one memory can
-     * own several chunks; results are collapsed to the best chunk per memory.
+     * Nearest chunks by cosine distance.
+     *
+     * <p>Returns passages rather than memories because that is what a citation
+     * needs to point at, and because full-text search returns the same unit —
+     * fusing two ranked lists that identify different things would be
+     * meaningless.
+     *
+     * <p>Joined through to {@code memories} so ownership and status are enforced
+     * in the query. A chunk of a sensitive memory has no embedding at all, so
+     * such memories cannot surface here regardless.
      */
-    public List<ScoredMemory> searchMemories(UUID userId, float[] queryVector, MemoryStatus status, int limit) {
-        String vector = toVectorLiteral(queryVector);
-        List<ScoredMemory> rows = jdbc.query("""
-                        SELECT m.id AS memory_id, (e.embedding <=> ?::vector) AS distance
+    public List<ScoredChunk> searchChunks(UUID userId, float[] queryVector, MemoryStatus status, int limit) {
+        return jdbc.query("""
+                        SELECT c.id AS chunk_id, c.memory_id, (e.embedding <=> ?::vector) AS distance
                         FROM embeddings e
-                        JOIN memories m ON m.id = e.owner_id
-                        WHERE e.owner_type = 'MEMORY'
+                        JOIN memory_chunks c ON c.id = e.owner_id
+                        JOIN memories m ON m.id = c.memory_id
+                        WHERE e.owner_type = 'CHUNK'
                           AND m.user_id = ?
                           AND m.status = ?
                         ORDER BY distance ASC
                         LIMIT ?
                         """,
-                (rs, rowNum) -> new ScoredMemory(rs.getObject("memory_id", UUID.class), rs.getDouble("distance")),
-                vector, userId, status.name(), limit * 3);
-
-        Map<UUID, ScoredMemory> bestPerMemory = new LinkedHashMap<>();
-        for (ScoredMemory row : rows) {
-            bestPerMemory.merge(row.memoryId(), row,
-                    (existing, candidate) -> candidate.distance() < existing.distance() ? candidate : existing);
-        }
-        return bestPerMemory.values().stream()
-                .sorted((a, b) -> Double.compare(a.distance(), b.distance()))
-                .limit(limit)
-                .toList();
+                (rs, rowNum) -> new ScoredChunk(
+                        rs.getObject("chunk_id", UUID.class),
+                        rs.getObject("memory_id", UUID.class),
+                        rs.getDouble("distance")),
+                toVectorLiteral(queryVector), userId, status.name(), limit);
     }
 
-    /** Memories that have no embedding yet — used to backfill after Ollama was unreachable. */
-    public List<UUID> findMemoryIdsMissingEmbeddings(UUID userId, int limit) {
+    /** Chunks that have no embedding yet — drives the backfill. */
+    public List<UUID> findChunkIdsMissingEmbeddings(UUID userId, int limit) {
         return jdbc.queryForList("""
-                        SELECT m.id
-                        FROM memories m
+                        SELECT c.id
+                        FROM memory_chunks c
+                        JOIN memories m ON m.id = c.memory_id
                         WHERE m.user_id = ?
+                          AND m.sensitive = FALSE
                           AND NOT EXISTS (
                               SELECT 1 FROM embeddings e
-                              WHERE e.owner_type = 'MEMORY' AND e.owner_id = m.id
+                              WHERE e.owner_type = 'CHUNK' AND e.owner_id = c.id
                           )
                         LIMIT ?
                         """,

@@ -70,8 +70,22 @@ digitalself:
     timeout-seconds: 60
     # Below this, extracted text is not worth a memory (e.g. a lone page number).
     min-chars-to-index: 20
+  intent:
+    # Routes each question before any retrieval happens, so general questions are
+    # answered from the model's own knowledge and never search personal memory.
+    # Set false to treat every question as a memory question — the behaviour
+    # before routing existed. Safe, but it refuses ordinary questions.
+    enabled: ${DIGITALSELF_INTENT_ENABLED:true}
+    # Classification emits one word; a small model does it far faster than the
+    # model answering. Empty reuses the chat model.
+    model: ${DIGITALSELF_INTENT_MODEL:}
+    min-confidence: 0.5
   rag:
     max-context-memories: 8
+    # Total tokens of retrieved passages allowed into one prompt. A privacy
+    # control as much as a cost one: only the minimum relevant context should
+    # reach the model. Retrieval stops at whole passages, never mid-passage.
+    max-context-tokens: ${RAG_MAX_CONTEXT_TOKENS:3000}
     # A memory derived from a whole document can be enormous; without a cap a
     # few of them would exceed any local model's context window.
     max-chars-per-context-memory: 2000

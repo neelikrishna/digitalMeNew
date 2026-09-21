@@ -60,9 +60,61 @@ The trade-off is real and deliberate: a sensitive memory will not surface in cha
 
 `POST /api/chat` takes `{"question": "...", "conversationId": null}` and returns the answer plus `groundedInMemories` — the memory ids and provenance labels actually placed in the model's context, so any claim can be traced to a stored row.
 
-**How hallucination is prevented structurally:** if hybrid retrieval returns nothing above the relevance threshold, the model is never invoked at all — the endpoint returns `"I don't have a memory of that."` with `answeredFromMemory: false`. A prompt instruction alone is not relied on.
+### Intent routing
 
-Retrieval is hybrid (see [../docs/ai-architecture.md](../docs/ai-architecture.md)): pgvector cosine similarity fused with Postgres full-text ranking via reciprocal rank fusion. If Ollama is unreachable, vector search degrades to keyword-only rather than failing the question.
+Every question is classified **before** any retrieval happens, so a general
+question never searches personal memory:
+
+| Intent | Retrieval | The model may… |
+|---|---|---|
+| `PERSONAL_MEMORY` | yes | answer **only** from retrieved memories; nothing found → it is never invoked |
+| `HYBRID` | yes | use both, required to label which is which |
+| `GENERAL_KNOWLEDGE` | **no** | answer from its own knowledge, marked as general |
+| `CURRENT_INFORMATION` | no | nothing — answered honestly, there is no internet access |
+| `CASUAL_CONVERSATION` | no | reply briefly |
+
+`"What is the chemical formula of water?"` is answered normally.
+`"What did I say about my Java project?"` is answered strictly from memory.
+`"Given my architecture, should I use pgvector?"` uses both, kept apart.
+
+The response carries `intent`, `intentConfidence`, `answeredFromMemory` and
+`usedGeneralKnowledge`, so a surprising answer can be explained rather than
+looking like the archive is empty.
+
+Every failure path lands somewhere safe: an unreachable classifier falls back to
+first-person heuristics, a low-confidence guess is not acted on, and anything
+still ambiguous goes to the strictest branch. `DIGITALSELF_INTENT_ENABLED=false`
+restores memory-only behaviour entirely.
+
+**How hallucination is prevented structurally:** on the personal branch, if hybrid retrieval returns nothing above the relevance threshold, the model is never invoked at all — the endpoint returns `"I don't have a memory of that."` with `answeredFromMemory: false`. A prompt instruction alone is not relied on. Routing does not weaken this: it decides *whether* a question is personal, and personal questions are handled exactly as before.
+
+### Passages, not whole memories
+
+Retrieval works on **chunks** — passages within a memory — rather than memories
+whole. A 200-page PDF is one memory but many passages, so an answer can cite the
+paragraph it came from instead of the document.
+
+Both searches return the same unit deliberately. Fusing a ranked list of memories
+with a ranked list of passages would be comparing different things, so vector
+search and full-text search both return chunks and reciprocal rank fusion
+combines them.
+
+Each chunk records where it sits in its source — character offsets for documents,
+page numbers, and millisecond ranges for audio and video — which is what lets a
+citation say `page 4` or `12:34–14:02`. `GET /api/memories/{id}/chunks` shows how
+a memory was split, which is usually the explanation when an answer cites an odd
+passage.
+
+Text is split on paragraph boundaries, falling back to sentences and then words,
+and every chunk satisfies `text.equals(source.substring(start, end))` — the
+invariant that lets a citation highlight the exact span in the original.
+
+**Chunks inherit their memory's sensitivity exactly.** A sensitive memory's
+passages are encrypted under the same key, are never embedded, and have a null
+plaintext column so they cannot match full-text search. Without that, splitting a
+memory into passages would quietly undo the encryption applied to it.
+
+Retrieval is hybrid (see [../docs/ai-architecture.md](../docs/ai-architecture.md)): pgvector cosine similarity fused with Postgres full-text ranking via reciprocal rank fusion. If Ollama is unreachable, vector search degrades to keyword-only rather than failing the question. The context is bounded by `max-context-tokens`, and retrieval stops at whole passages rather than clipping one — a truncated passage is worse evidence than one fewer passage.
 
 Embedding happens *after* the database transaction commits, so an Ollama call never holds a Postgres transaction open. The trade-off: a memory can be saved successfully but left unindexed if the model was down — `POST /api/memories/reindex` backfills those.
 

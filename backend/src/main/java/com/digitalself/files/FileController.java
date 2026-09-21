@@ -10,8 +10,11 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import org.springframework.format.annotation.DateTimeFormat;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -62,6 +65,22 @@ public class FileController {
     @GetMapping
     public ResponseEntity<List<FileResponse>> list(@AuthenticationPrincipal UUID userId) {
         return ResponseEntity.ok(fileService.listResponses(userId));
+    }
+
+    /**
+     * Photos, newest first — the "what was I doing that summer" view EXIF exists
+     * to serve. Both bounds are optional and ISO-8601 instants.
+     *
+     * <p>With no bounds, photos carrying no capture date are included last. With
+     * bounds they cannot match, so the response reports how many were left out
+     * rather than letting a short list look like the whole library.
+     */
+    @GetMapping("/photos")
+    public ResponseEntity<FileService.PhotoListing> photos(
+            @AuthenticationPrincipal UUID userId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+        return ResponseEntity.ok(fileService.photos(userId, from, to));
     }
 
     @GetMapping("/{id}")

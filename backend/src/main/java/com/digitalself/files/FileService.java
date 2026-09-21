@@ -15,6 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 import javax.crypto.SecretKey;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -187,6 +188,55 @@ public class FileService {
         return FileResponse.from(file,
                 metadataRepository.findById(fileId).orElse(null),
                 mediaRepository.findById(fileId).orElse(null));
+    }
+
+    /**
+     * Photos, newest first. With no window, undated photos are included last
+     * rather than omitted — an EXIF-stripped image is still a photo the owner
+     * uploaded, and silently dropping it would make the gallery look broken.
+     *
+     * <p>Supplying a window necessarily excludes undated photos, since there is
+     * nothing to match them against. That is reported in the result rather than
+     * left for the caller to deduce from a short list.
+     */
+    @Transactional(readOnly = true)
+    public PhotoListing photos(UUID userId, Instant from, Instant to) {
+        boolean windowed = from != null || to != null;
+        List<MediaMetadata> all = mediaRepository.findAllOfType(userId, MediaType.PHOTO);
+
+        List<MediaMetadata> selected = windowed
+                ? mediaRepository.findTakenBetween(userId,
+                        from == null ? Instant.EPOCH : from,
+                        to == null ? Instant.now() : to)
+                : all;
+
+        long undated = all.stream().filter(media -> media.getTakenAt() == null).count();
+
+        List<StoredFile> files = fileRepository.findAllById(
+                selected.stream().map(MediaMetadata::getFileId).toList());
+        Map<UUID, StoredFile> byId = files.stream()
+                .collect(Collectors.toMap(StoredFile::getId, Function.identity()));
+        Map<UUID, FileMetadata> metadata = metadataRepository
+                .findAllById(byId.keySet()).stream()
+                .collect(Collectors.toMap(FileMetadata::getFileId, Function.identity()));
+
+        // Driven off the media list, not the file list, to preserve the ordering
+        // the query established.
+        List<FileResponse> responses = selected.stream()
+                .map(media -> byId.get(media.getFileId()) == null ? null
+                        : FileResponse.from(byId.get(media.getFileId()),
+                                metadata.get(media.getFileId()), media))
+                .filter(java.util.Objects::nonNull)
+                .toList();
+
+        return new PhotoListing(responses, windowed ? undated : 0);
+    }
+
+    /**
+     * @param undatedExcluded photos left out because they carry no capture date.
+     *                        Always 0 when no window was given.
+     */
+    public record PhotoListing(List<FileResponse> photos, long undatedExcluded) {
     }
 
     /**

@@ -10,6 +10,7 @@ import com.digitalself.files.MediaMetadata;
 import com.digitalself.files.MediaType;
 import com.digitalself.files.StoredFile;
 import com.digitalself.memory.*;
+import com.digitalself.memory.chunk.MemoryChunk;
 import com.digitalself.memory.dto.CreateMemoryRequest;
 import com.digitalself.memory.dto.CreateLinkRequest;
 import com.digitalself.memory.dto.MemoryResponse;
@@ -29,6 +30,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Base64;
 import java.util.List;
@@ -127,6 +129,8 @@ class SchemaIntegrationTest {
     private com.digitalself.files.MediaMetadataRepository mediaMetadataRepository;
     @Autowired
     private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
+    @Autowired
+    private com.digitalself.memory.chunk.MemoryChunkRepository memoryChunkRepository;
 
     private UUID userId;
 
@@ -615,6 +619,135 @@ class SchemaIntegrationTest {
         assertEquals(0, jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM memories WHERE user_id = ? AND source = 'FILE_EXTRACTION'",
                 Integer.class, userId));
+    }
+
+    /**
+     * The gallery must not hide EXIF-stripped images. Most photos shared through
+     * messaging apps have no capture date, so a listing that only returned dated
+     * ones would silently omit much of a real library.
+     */
+    @Test
+    void photoListingIncludesImagesThatCarryNoCaptureDate() {
+        fileService.upload(userId, "stripped.png", onePixelPng(), false);
+
+        com.digitalself.files.FileService.PhotoListing listing = fileService.photos(userId, null, null);
+
+        assertEquals(1, listing.photos().size(), "an undated photo must still be listed");
+        assertNull(listing.photos().get(0).photo().takenAt());
+        assertEquals(0, listing.undatedExcluded(), "nothing is excluded when no window is given");
+    }
+
+    /**
+     * Asking for a date window necessarily excludes undated photos. The count is
+     * reported so a short list cannot be mistaken for the whole library.
+     */
+    @Test
+    void aDateWindowReportsHowManyUndatedPhotosItLeftOut() {
+        fileService.upload(userId, "stripped.png", onePixelPng(), false);
+
+        com.digitalself.files.FileService.PhotoListing listing = fileService.photos(
+                userId, Instant.parse("2020-01-01T00:00:00Z"), Instant.parse("2021-01-01T00:00:00Z"));
+
+        assertTrue(listing.photos().isEmpty());
+        assertEquals(1, listing.undatedExcluded(),
+                "the caller must be told photos were omitted for lack of a date");
+    }
+
+    @Test
+    void photoListingDoesNotLeakAcrossUsers() {
+        fileService.upload(userId, "mine.png", onePixelPng(), false);
+
+        User other = userRepository.save(new User(
+                "other-" + UUID.randomUUID() + "@example.com", "hash", "Other", UserRole.OWNER));
+
+        assertTrue(fileService.photos(other.getId(), null, null).photos().isEmpty());
+    }
+
+    @Test
+    void photoListingExcludesNonImageUploads() {
+        fileService.upload(userId, "notes.txt", "Just some text.".getBytes(), false);
+
+        assertTrue(fileService.photos(userId, null, null).photos().isEmpty(),
+                "a document is not a photo and must not appear in the gallery");
+    }
+
+    // ---------- chunking ----------
+
+    @Test
+    void aMemoryIsSplitIntoRetrievablePassages() {
+        String longText = ("This paragraph describes a day in some detail, at enough length "
+                + "that the chunker has something to divide.\n\n").repeat(12);
+
+        MemoryResponse created = memoryService.create(userId, new CreateMemoryRequest(
+                MemoryType.EPISODIC, "A long entry", longText, MemorySource.USER_INPUT,
+                null, null, null, null, false, Set.of()));
+
+        List<MemoryChunk> chunks = memoryChunkRepository
+                .findByMemoryIdOrderByChunkIndexAsc(created.id());
+
+        assertTrue(chunks.size() > 1, "a long memory should produce several passages");
+        for (int i = 0; i < chunks.size(); i++) {
+            assertEquals(i, chunks.get(i).getChunkIndex());
+            assertFalse(chunks.get(i).isEncrypted());
+            assertNotNull(chunks.get(i).getContent());
+        }
+    }
+
+    /**
+     * The rule that keeps chunking from becoming a hole through the encryption:
+     * a passage of a sensitive memory must be no more readable than its parent.
+     */
+    @Test
+    void chunksOfASensitiveMemoryAreEncryptedAndUnsearchable() {
+        MemoryResponse created = memoryService.create(userId, new CreateMemoryRequest(
+                MemoryType.EPISODIC, "Private", "A reflection containing CHUNK-SECRET-MARKER within it.",
+                MemorySource.USER_INPUT, null, null, null, null, true, Set.of()));
+
+        List<MemoryChunk> chunks = memoryChunkRepository.findByMemoryIdOrderByChunkIndexAsc(created.id());
+        assertFalse(chunks.isEmpty(), "a sensitive memory is still chunked so the owner can read it back");
+
+        for (MemoryChunk chunk : chunks) {
+            assertTrue(chunk.isEncrypted(), "every passage of a sensitive memory must be ciphertext");
+            assertNull(chunk.getContent());
+        }
+
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memory_chunks WHERE content LIKE '%CHUNK-SECRET-MARKER%'",
+                Integer.class), "no passage may leak the plaintext of a sensitive memory");
+
+        assertTrue(textSearch.searchChunks(userId, "CHUNK-SECRET-MARKER", MemoryStatus.ACTIVE, 10).isEmpty(),
+                "passages of sensitive memories must be unreachable by full-text search");
+    }
+
+    @Test
+    void revisingAMemoryReplacesItsPassagesRatherThanAddingToThem() {
+        MemoryResponse created = memoryService.create(userId, new CreateMemoryRequest(
+                MemoryType.EPISODIC, "Note", "The original wording, OLD-TEXT-MARKER.",
+                MemorySource.USER_INPUT, null, null, null, null, false, Set.of()));
+
+        memoryService.revise(userId, created.id(), new ReviseMemoryRequest(
+                "The corrected wording, NEW-TEXT-MARKER.", null, null, ChangeReason.USER_CORRECTION));
+
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memory_chunks WHERE memory_id = ? AND content LIKE '%OLD-TEXT-MARKER%'",
+                Integer.class, created.id()),
+                "superseded text must not linger in the passages retrieval reads");
+        assertTrue(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM memory_chunks WHERE memory_id = ? AND content LIKE '%NEW-TEXT-MARKER%'",
+                Integer.class, created.id()) > 0);
+    }
+
+    @Test
+    void chunkSearchDoesNotLeakAcrossUsers() {
+        memoryService.create(userId, new CreateMemoryRequest(
+                MemoryType.EPISODIC, "Mine", "A memory about kayaking rivers.",
+                MemorySource.USER_INPUT, null, null, null, null, false, Set.of()));
+
+        User other = userRepository.save(new User(
+                "other-" + UUID.randomUUID() + "@example.com", "hash", "Other", UserRole.OWNER));
+
+        assertFalse(textSearch.searchChunks(userId, "kayaking", MemoryStatus.ACTIVE, 10).isEmpty());
+        assertTrue(textSearch.searchChunks(other.getId(), "kayaking", MemoryStatus.ACTIVE, 10).isEmpty());
     }
 
     /** Valid 1x1 PNG. Carries no EXIF, which is the common case for a stripped image. */

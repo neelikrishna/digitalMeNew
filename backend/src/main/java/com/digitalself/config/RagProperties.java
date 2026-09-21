@@ -27,8 +27,28 @@ public class RagProperties {
      */
     private int maxCharsPerContextMemory = 2000;
 
+    /**
+     * Total tokens of retrieved passages allowed into one prompt.
+     *
+     * <p>A privacy control as much as a cost one: the requirement is that only
+     * the minimum relevant context reaches the model, and an unbounded context
+     * would send far more of someone's life than the question called for.
+     *
+     * <p>Retrieval stops at whole passages rather than clipping one in half — a
+     * truncated passage is worse evidence than one fewer passage.
+     */
+    private int maxContextTokens = 3000;
+
     private int chunkSize = 1000;
     private int chunkOverlap = 100;
+
+    public int getMaxContextTokens() {
+        return maxContextTokens;
+    }
+
+    public void setMaxContextTokens(int maxContextTokens) {
+        this.maxContextTokens = maxContextTokens;
+    }
 
     public int getMaxCharsPerContextMemory() {
         return maxCharsPerContextMemory;

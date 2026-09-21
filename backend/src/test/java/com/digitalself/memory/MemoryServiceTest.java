@@ -37,7 +37,8 @@ class MemoryServiceTest {
         events = mock(ApplicationEventPublisher.class);
         MemoryContentCrypto crypto = mock(MemoryContentCrypto.class);
         service = new MemoryService(memoryRepository, versionRepository, tagRepository,
-                mock(AuditService.class), events, crypto, new MemoryMapper(crypto));
+                mock(AuditService.class), events, crypto, new MemoryMapper(crypto),
+                mock(com.digitalself.memory.chunk.MemoryChunker.class));
 
         when(memoryRepository.saveAndFlush(any(Memory.class))).thenAnswer(i -> i.getArgument(0));
         when(memoryRepository.save(any(Memory.class))).thenAnswer(i -> i.getArgument(0));

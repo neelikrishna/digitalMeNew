@@ -1,8 +1,10 @@
 package com.digitalself.memory;
 
 import com.digitalself.ai.EmbeddingService;
-import com.digitalself.ai.TextChunker;
-import com.digitalself.config.RagProperties;
+import com.digitalself.memory.chunk.ChunkContentType;
+import com.digitalself.memory.chunk.MemoryChunk;
+import com.digitalself.memory.chunk.MemoryChunkRepository;
+import com.digitalself.memory.chunk.MemoryChunker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -14,13 +16,18 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Generates and stores embeddings for memories.
+ * Splits a memory into passages and embeds them.
  *
- * <p>Runs after the database transaction commits so an Ollama call — which can
- * take seconds — never holds a Postgres transaction open. The trade-off is that
- * indexing can fail after the memory is safely saved; that is deliberate. A
- * memory must never be lost because the model was unreachable, so failures are
- * logged and the memory is picked up later by {@link #backfill(UUID, int)}.
+ * <p>Two steps with deliberately different transaction behaviour. Chunking is
+ * deterministic and fast, so it runs in its own short transaction. Embedding
+ * calls a model and can take seconds, so it runs outside any transaction — a
+ * Postgres transaction must never be held open across a model call.
+ *
+ * <p>The whole thing runs after the memory's own transaction commits. That means
+ * a memory can be saved successfully and left unindexed if the model was down,
+ * which is the correct direction to fail: a memory must never be lost because an
+ * embedding could not be produced. Failures are logged and repaired by
+ * {@link #backfill(UUID, int)}.
  */
 @Component
 public class MemoryIndexer {
@@ -28,18 +35,24 @@ public class MemoryIndexer {
     private static final Logger log = LoggerFactory.getLogger(MemoryIndexer.class);
 
     private final MemoryRepository memoryRepository;
+    private final MemoryMapper mapper;
+    private final MemoryChunker chunker;
+    private final MemoryChunkRepository chunkRepository;
     private final EmbeddingService embeddingService;
     private final EmbeddingStore embeddingStore;
-    private final RagProperties ragProperties;
 
     public MemoryIndexer(MemoryRepository memoryRepository,
+                         MemoryMapper mapper,
+                         MemoryChunker chunker,
+                         MemoryChunkRepository chunkRepository,
                          EmbeddingService embeddingService,
-                         EmbeddingStore embeddingStore,
-                         RagProperties ragProperties) {
+                         EmbeddingStore embeddingStore) {
         this.memoryRepository = memoryRepository;
+        this.mapper = mapper;
+        this.chunker = chunker;
+        this.chunkRepository = chunkRepository;
         this.embeddingService = embeddingService;
         this.embeddingStore = embeddingStore;
-        this.ragProperties = ragProperties;
     }
 
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
@@ -58,41 +71,72 @@ public class MemoryIndexer {
             return;
         }
 
-        // Sensitive memories are not embedded. An embedding is a lossy but real
-        // representation of the text, and storing one unencrypted would undo the
-        // point of encrypting the memory. Deleting first matters: a memory that
-        // has just been promoted to sensitive must not keep the vector derived
-        // from its former plaintext.
+        List<MemoryChunk> chunks = rechunk(memory);
+
+        // Sensitive memories are chunked — so the owner can still read them back —
+        // but never embedded. An embedding is a lossy but real representation of
+        // the text, and storing one unencrypted would undo the encryption. Any
+        // vector left over from before the memory was made sensitive goes too.
         if (memory.isSensitive()) {
             embeddingStore.deleteForOwner(EmbeddingOwnerType.MEMORY, memoryId);
+            chunks.forEach(chunk -> embeddingStore.deleteForOwner(EmbeddingOwnerType.CHUNK, chunk.getId()));
             return;
         }
 
-        String text = memory.getTitle() == null || memory.getTitle().isBlank()
-                ? memory.getContent()
-                : memory.getTitle() + "\n\n" + memory.getContent();
+        embed(chunks);
 
-        List<String> chunks = TextChunker.chunk(text, ragProperties.getChunkSize(), ragProperties.getChunkOverlap());
-        List<float[]> vectors = new ArrayList<>(chunks.size());
-        for (String chunk : chunks) {
-            vectors.add(embeddingService.embed(chunk));
+        // Drop the pre-chunking memory-level vector once passage vectors exist,
+        // so the same memory cannot be matched twice by two different units.
+        embeddingStore.deleteForOwner(EmbeddingOwnerType.MEMORY, memoryId);
+    }
+
+    private List<MemoryChunk> rechunk(Memory memory) {
+        String title = mapper.title(memory);
+        String content = mapper.content(memory);
+        String text = title == null || title.isBlank() ? content : title + "\n\n" + content;
+        return chunker.rechunk(memory, text, ChunkContentType.TEXT);
+    }
+
+    /** Outside any transaction: one model call per chunk, none of them holding a lock. */
+    private void embed(List<MemoryChunk> chunks) {
+        for (MemoryChunk chunk : chunks) {
+            String text = chunker.readableText(chunk);
+            if (text == null || text.isBlank()) {
+                continue;
+            }
+            List<float[]> vector = new ArrayList<>(1);
+            vector.add(embeddingService.embed(text));
+            embeddingStore.replaceForOwner(
+                    EmbeddingOwnerType.CHUNK, chunk.getId(), vector, embeddingService.modelName());
         }
-        embeddingStore.replaceForOwner(EmbeddingOwnerType.MEMORY, memoryId, vectors, embeddingService.modelName());
     }
 
     /**
-     * Indexes memories that have no embedding — those created while the model
-     * was unreachable. Returns how many were successfully indexed.
+     * Indexes memories that were never chunked, and chunks that were never
+     * embedded — the state left behind when the model was unreachable, and the
+     * migration path for memories written before chunking existed.
+     *
+     * @return how many memories were newly indexed
      */
     public int backfill(UUID userId, int limit) {
-        List<UUID> pending = embeddingStore.findMemoryIdsMissingEmbeddings(userId, limit);
         int indexed = 0;
-        for (UUID memoryId : pending) {
+
+        for (UUID memoryId : chunkRepository.findMemoryIdsWithoutChunks(userId).stream().limit(limit).toList()) {
             try {
                 index(memoryId);
                 indexed++;
             } catch (Exception e) {
                 log.warn("Backfill failed for memory {}: {}", memoryId, e.toString());
+            }
+        }
+
+        // Chunks that exist but were never embedded, typically because the model
+        // was down after a successful chunking pass.
+        for (UUID chunkId : embeddingStore.findChunkIdsMissingEmbeddings(userId, limit)) {
+            try {
+                chunkRepository.findById(chunkId).ifPresent(chunk -> embed(List.of(chunk)));
+            } catch (Exception e) {
+                log.warn("Backfill failed for chunk {}: {}", chunkId, e.toString());
             }
         }
         return indexed;

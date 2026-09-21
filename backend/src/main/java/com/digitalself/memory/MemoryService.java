@@ -1,6 +1,7 @@
 package com.digitalself.memory;
 
 import com.digitalself.audit.AuditService;
+import com.digitalself.memory.dto.ChunkResponse;
 import com.digitalself.memory.dto.CreateMemoryRequest;
 import com.digitalself.memory.dto.MemoryResponse;
 import com.digitalself.memory.dto.MemorySearchQuery;
@@ -29,6 +30,7 @@ public class MemoryService {
     private final ApplicationEventPublisher events;
     private final MemoryContentCrypto crypto;
     private final MemoryMapper mapper;
+    private final com.digitalself.memory.chunk.MemoryChunker chunker;
 
     public MemoryService(MemoryRepository memoryRepository,
                          MemoryVersionRepository versionRepository,
@@ -36,7 +38,8 @@ public class MemoryService {
                          AuditService auditService,
                          ApplicationEventPublisher events,
                          MemoryContentCrypto crypto,
-                         MemoryMapper mapper) {
+                         MemoryMapper mapper,
+                         com.digitalself.memory.chunk.MemoryChunker chunker) {
         this.memoryRepository = memoryRepository;
         this.versionRepository = versionRepository;
         this.tagRepository = tagRepository;
@@ -44,6 +47,7 @@ public class MemoryService {
         this.events = events;
         this.crypto = crypto;
         this.mapper = mapper;
+        this.chunker = chunker;
     }
 
     /**
@@ -235,6 +239,31 @@ public class MemoryService {
         memoryRepository.save(memory);
         auditService.record(userId, "MEMORY_RESTORED", "memory", memoryId, null, null);
         return mapper.toResponse(memory);
+    }
+
+    /** The passages a memory was split into, decrypting them if it is sensitive. */
+    @Transactional(readOnly = true)
+    public List<ChunkResponse> chunks(UUID userId, UUID memoryId) {
+        get(userId, memoryId); // ownership check
+        return chunker.chunksOf(memoryId).stream()
+                .map(chunk -> new ChunkResponse(
+                        chunk.getId(),
+                        chunk.getChunkIndex(),
+                        chunker.readableText(chunk),
+                        chunk.getContentType(),
+                        chunk.getStartOffset(),
+                        chunk.getEndOffset(),
+                        locationLabel(chunk),
+                        chunk.getSourceFileId(),
+                        chunk.getTokenEstimate()))
+                .toList();
+    }
+
+    private static String locationLabel(com.digitalself.memory.chunk.MemoryChunk chunk) {
+        if (chunk.getStartMs() != null && chunk.getEndMs() != null) {
+            return chunk.getStartMs() + "ms–" + chunk.getEndMs() + "ms";
+        }
+        return chunk.getPageNumber() == null ? null : "page " + chunk.getPageNumber();
     }
 
     @Transactional(readOnly = true)

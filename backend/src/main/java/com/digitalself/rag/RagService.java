@@ -7,6 +7,8 @@ import com.digitalself.conversation.*;
 import com.digitalself.crypto.TextCrypto;
 import com.digitalself.rag.dto.ChatRequest;
 import com.digitalself.rag.dto.ChatResponse;
+import com.digitalself.rag.intent.IntentClassifier;
+import com.digitalself.rag.intent.IntentDecision;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,14 +17,33 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Answers a question, choosing what the model is allowed to draw on.
+ *
+ * <p>Routing happens <em>before</em> retrieval. That ordering is the whole
+ * design: a general question never touches personal memory, and a personal
+ * question can still be refused outright when nothing relevant is stored, which
+ * is what keeps invented personal history structurally impossible rather than
+ * merely discouraged.
+ */
 @Service
 public class RagService {
 
     static final String NO_MEMORY_ANSWER = "I don't have a memory of that.";
 
+    /**
+     * There is no internet access by design — nothing in this system reaches off
+     * the machine. Saying so is better than a local model guessing at today's
+     * weather from training data that is months old.
+     */
+    static final String NO_LIVE_DATA_ANSWER =
+            "I can't look that up — I have no access to anything outside this machine, "
+                    + "so I have no live information like weather, news or prices.";
+
     /** How many prior turns are replayed to the model for conversational context. */
     private static final int HISTORY_TURNS = 6;
 
+    private final IntentClassifier intentClassifier;
     private final HybridRetriever retriever;
     private final PromptBuilder promptBuilder;
     private final AIService aiService;
@@ -31,13 +52,15 @@ public class RagService {
     private final AuditService auditService;
     private final TextCrypto textCrypto;
 
-    public RagService(HybridRetriever retriever,
+    public RagService(IntentClassifier intentClassifier,
+                      HybridRetriever retriever,
                       PromptBuilder promptBuilder,
                       AIService aiService,
                       ConversationRepository conversationRepository,
                       ChatMessageRepository messageRepository,
                       AuditService auditService,
                       TextCrypto textCrypto) {
+        this.intentClassifier = intentClassifier;
         this.retriever = retriever;
         this.promptBuilder = promptBuilder;
         this.aiService = aiService;
@@ -55,27 +78,82 @@ public class RagService {
         List<Message> history = recentHistory(conversation.getId());
         storeMessage(conversation.getId(), MessageRole.USER, request.question());
 
-        List<RetrievedMemory> retrieved = retriever.retrieve(userId, request.question());
+        IntentDecision decision = intentClassifier.classify(request.question());
 
-        // Structural guard, not just a prompt instruction: with nothing relevant
-        // retrieved the model is never invoked, so it cannot invent a memory.
+        ChatResponse response = switch (decision.intent()) {
+            case CURRENT_INFORMATION -> withoutModel(conversation, decision, NO_LIVE_DATA_ANSWER);
+            case CASUAL_CONVERSATION -> answerGenerally(conversation, decision, request, history, promptBuilder.casual());
+            case GENERAL_KNOWLEDGE -> answerGenerally(conversation, decision, request, history, promptBuilder.general());
+            case PERSONAL_MEMORY -> answerFromMemory(userId, conversation, decision, request, history);
+            case HYBRID -> answerFromBoth(userId, conversation, decision, request, history);
+        };
+
+        // The classification is audited, never the question itself — an audit
+        // table holding every question asked would be an unencrypted copy of the
+        // most sensitive thing in the system.
+        auditService.record(userId, "CHAT_" + decision.intent().name(), "conversation",
+                conversation.getId(), null, null);
+        return response;
+    }
+
+    /**
+     * Strict branch, unchanged in behaviour. Nothing retrieved means the model is
+     * never invoked, so it has no opportunity to fabricate a memory.
+     */
+    private ChatResponse answerFromMemory(UUID userId, Conversation conversation, IntentDecision decision,
+                                           ChatRequest request, List<Message> history) {
+        List<RetrievedPassage> retrieved = retriever.retrieve(userId, request.question());
+
         if (retrieved.isEmpty()) {
             storeMessage(conversation.getId(), MessageRole.ASSISTANT, NO_MEMORY_ANSWER);
-            auditService.record(userId, "CHAT_ANSWERED_WITHOUT_MEMORY", "conversation", conversation.getId(), null, null);
-            return new ChatResponse(conversation.getId(), NO_MEMORY_ANSWER, false, List.of());
+            return ChatResponse.of(conversation.getId(), NO_MEMORY_ANSWER, decision, false, false, List.of());
         }
 
-        String systemPrompt = promptBuilder.buildSystemPrompt(retrieved);
-        String answer = aiService.complete(systemPrompt, request.question(), history);
-
+        String answer = aiService.complete(promptBuilder.strict(retrieved), request.question(), history);
         storeMessage(conversation.getId(), MessageRole.ASSISTANT, answer);
-        auditService.record(userId, "CHAT_ANSWERED_FROM_MEMORY", "conversation", conversation.getId(), null, null);
+        return ChatResponse.of(conversation.getId(), answer, decision, true, false, cite(retrieved));
+    }
 
-        List<ChatResponse.CitedMemory> cited = retrieved.stream()
-                .map(r -> new ChatResponse.CitedMemory(r.memoryId(), r.title(), r.provenanceLabel()))
+    /**
+     * Both sources. Unlike the strict branch this does not refuse when retrieval
+     * is empty — the general half of the question is still answerable, and the
+     * prompt requires the model to say it has nothing on record for the personal
+     * half rather than filling it in.
+     */
+    private ChatResponse answerFromBoth(UUID userId, Conversation conversation, IntentDecision decision,
+                                         ChatRequest request, List<Message> history) {
+        List<RetrievedPassage> retrieved = retriever.retrieve(userId, request.question());
+
+        String answer = aiService.complete(promptBuilder.hybrid(retrieved), request.question(), history);
+        storeMessage(conversation.getId(), MessageRole.ASSISTANT, answer);
+        return ChatResponse.of(conversation.getId(), answer, decision,
+                !retrieved.isEmpty(), true, cite(retrieved));
+    }
+
+    /** No retrieval at all: personal memory is never read for these. */
+    private ChatResponse answerGenerally(Conversation conversation, IntentDecision decision,
+                                          ChatRequest request, List<Message> history, String systemPrompt) {
+        String answer = aiService.complete(systemPrompt, request.question(), history);
+        storeMessage(conversation.getId(), MessageRole.ASSISTANT, answer);
+        return ChatResponse.of(conversation.getId(), answer, decision, false, true, List.of());
+    }
+
+    /** A fixed reply where invoking the model would only produce a plausible guess. */
+    private ChatResponse withoutModel(Conversation conversation, IntentDecision decision, String answer) {
+        storeMessage(conversation.getId(), MessageRole.ASSISTANT, answer);
+        return ChatResponse.of(conversation.getId(), answer, decision, false, false, List.of());
+    }
+
+    private List<ChatResponse.CitedMemory> cite(List<RetrievedPassage> retrieved) {
+        return retrieved.stream()
+                .map(passage -> new ChatResponse.CitedMemory(
+                        passage.memoryId(),
+                        passage.chunkId(),
+                        passage.memoryTitle(),
+                        passage.provenanceLabel(),
+                        passage.locationLabel(),
+                        passage.sourceFileId()))
                 .toList();
-
-        return new ChatResponse(conversation.getId(), answer, true, cited);
     }
 
     private Conversation resolveConversation(UUID userId, ChatRequest request) {

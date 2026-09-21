@@ -46,9 +46,14 @@
 - *Python (FastAPI)* — natural fit for AI code, but weaker as a long-lived transactional backend (auth, RBAC, migrations are all workable but less idiomatic than in Spring's ecosystem).
 - *Node/Express* — fine for the mobile/web client side, less appealing for a strongly-typed domain model with entities like `Memory`, `MemoryVersion`, `Person`, `Event`.
 
-**Recommendation:** Java + Spring Boot for the backend API, since you already have Java depth, Spring Security gives you auth/RBAC out of the box, and Spring Data JPA plus Flyway/Liquibase gives you disciplined schema migrations — important for a database that's meant to grow for years. Python is used *only* where it's genuinely the best tool: file parsing/extraction pipelines (EXIF, PDF, WhatsApp export parsing, transcription) that run as a separate ingestion process and call back into the API, not as the API itself.
+**Recommendation:** Java + Spring Boot for the backend API, since you already have Java depth, Spring Security gives you auth/RBAC out of the box, and Spring Data JPA plus Flyway/Liquibase gives you disciplined schema migrations — important for a database that's meant to grow for years.
 
-**Future limitation:** two runtimes (JVM + Python) means two deployment units to operate. Mitigated by keeping the Python side stateless (it only extracts and hands structured data to the API) and running both via Docker Compose.
+**Amended after Phase 4 (2026-09-21).** This section originally assigned *all* file ingestion to Python. That turned out to be wrong, and the split now runs along a different line:
+
+- **In Java:** PDF/Office text extraction and photo EXIF. Tika was already a dependency for content sniffing and provides both, so moving this work to Python would have added a second runtime and a process boundary to cross while buying nothing. It would also have meant sending decrypted personal content over that boundary. See [file-ingestion.md](file-ingestion.md) and [media-ingestion.md](media-ingestion.md) for the full reasoning.
+- **Still Python, when built:** WhatsApp export parsing and audio/video transcription. These genuinely need libraries with no good JVM equivalent (`faster-whisper` in particular).
+
+**Future limitation:** the Python tasks still imply a second runtime, and decrypted content crossing a process boundary is what makes TLS a prerequisite for them rather than tidying — see [media-ingestion.md](media-ingestion.md) Section 5. Nothing in Phase 4 as built crosses that boundary, so the system remains a single deployment unit today.
 
 ## 4. Why a modular monolith, not microservices
 
